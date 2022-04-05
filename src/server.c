@@ -2,6 +2,7 @@
 #include <sys/types.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <curl/curl.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
@@ -20,6 +21,33 @@ void *connection_handler(void *);
 
 #define MAX_MSG 1024
 
+struct MemoryStruct {
+  char *memory;
+  size_t size;
+};
+ 
+static size_t
+WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+  size_t realsize = size * nmemb;
+  struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+ 
+  char *ptr = realloc(mem->memory, mem->size + realsize + 1);
+  if(!ptr) {
+    /* out of memory! */
+    printf("not enough memory (realloc returned NULL)\n");
+    return 0;
+  }
+ 
+  mem->memory = ptr;
+  memcpy(&(mem->memory[mem->size]), contents, realsize);
+  mem->size += realsize;
+  mem->memory[mem->size] = 0;
+ 
+  return realsize;
+}
+
+
 /*
  Servidor aguarda por mensagem do cliente, imprime na tela
  e depois envia resposta e finaliza processo
@@ -28,22 +56,22 @@ void *connection_handler(void *);
 int main(int argc, char* argv[]) {
 
     //Variaveis auxiliares para encontrar o arquivo a ser transferido.
-    DIR *mydir;
     struct dirent *myfile;
     struct stat mystat;
+    CURL *curl;
+    CURL *curl_handle;
+    CURLcode res;
+
     //verificando se foi executando o comando corretamente
-    if (argc != 3) {
-        fprintf(stderr, "use:./server [Porta] [local]\n");
+    if (argc != 2) {
+        fprintf(stderr, "use:./server [Porta]\n");
         return -1;
     } else if (!isdigit(*argv[1])) {
         fprintf(stderr, "Argumento invalido '%s'\n", argv[1]);
-        fprintf(stderr, "use:./server [Porta] [local]\n");
+        fprintf(stderr, "use:./server [Porta]\n");
         return -1;
     }
 
-    mydir = opendir(argv[2]);
-    //verificando se o diretorio existe
-    if(mydir == NULL ){fprintf(stderr, "Argumento invalido '%s'\n", argv[2]);return -1;}
     char* aux1 = argv[1];
         int portaServidor = atoi(aux1);
 
@@ -52,7 +80,13 @@ int main(int argc, char* argv[]) {
     struct sockaddr_in servidor, cliente;
     char *mensagem;
     char resposta[MAX_MSG];
+    char postMessage[MAX_MSG] = {0x00};
     int tamanho, count;
+
+    struct MemoryStruct chunk;
+ 
+    chunk.memory = malloc(1);  /* will be grown as needed by the realloc above */
+    chunk.size = 0;    /* no data at this point */
 
     // para pegar o IP e porta do cliente  
     char *cliente_ip;
@@ -81,125 +115,118 @@ int main(int argc, char* argv[]) {
         resposta[tamanho] = '\0';
         printf("O cliente falou: %s\n", resposta);
 
-        char aux_nomeArquivo[MAX_MSG];
+        //Aqui eu recebo os dados da transação
+        // char send_data[] = MODALITY_DEBIT "01" "000000000100";
+
+        char trans_Data[MAX_MSG];
         //fazendo copia do nome do arquivo para variavel auxiliar. tal variavel é utilizada para localizar
         // o arquivo no diretorio.
-        strncpy(aux_nomeArquivo, resposta, MAX_MSG);
-        printf("ax_nomeArquivo: %s\n", aux_nomeArquivo);
-
-
+        strncpy(trans_Data, resposta, MAX_MSG);
+        printf("trans_Data: %s\n", trans_Data);
 
         /*********************************************************/
-        if (mydir != NULL) {
+        if (strlen(trans_Data) == 16) {
+            /* In windows, this will init the winsock stuff */
+            curl_global_init(CURL_GLOBAL_ALL);
 
-            //funcao busca todo o diretorio buscando o arquivo na variavel aux_nomeArquivo
-            //struct stat s;
-            while ((myfile = readdir(mydir)) != NULL) {
+            /* get a curl handle */
+            curl = curl_easy_init();
+            if(curl) {
+                /* First set the URL that is about to receive our POST. This URL can
+                   just as well be a https:// URL if that is what should receive the
+                   data. */
+                curl_easy_setopt(curl, CURLOPT_URL, "ttp://tinywebdb.appinventor.mit.edu/storeavalue");
 
-                stat(myfile->d_name, &mystat);
+                /* Now specify the POST data */
+                sprintf(postMessage, "tag=qrcode_mp30&value=%s&fmt=html", trans_Data);
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postMessage);
 
-                printf("Arquivo lido: %s, Arquivo procurado: %s\n", myfile->d_name, resposta);
-                if (strcmp(myfile->d_name, resposta) == 0) {//arquivo existe
-                   closedir(mydir);
-                    //Reiniciando variáveis da pesquisa do diretorio para a proxima thread
-                    myfile = NULL;
-                    mydir = NULL;
-                    mydir = opendir(argv[2]);
+                /* Perform the request, res will get the return code */
+                res = curl_easy_perform(curl);
+                /* Check for errors */
+                if(res != CURLE_OK){
+                  fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+                }
 
-                    //**************************************//
-                    //      INICIO DO PROTOCOLO            //
-                    //*************************************//
+                /* always cleanup */
+                curl_easy_cleanup(curl);
+            }
 
+            curl_global_cleanup();
 
-                    mensagem = "200";
-                    //mensagem 2 - enviando confirmação q arquivo existe
-                    write(conexao, mensagem, strlen(mensagem));
+            if (res == CURLE_OK){
+              mensagem = "200";
+              write(conexao, mensagem, strlen(mensagem));
+            }else{
+              mensagem = "400";
+              write(conexao, mensagem, strlen(mensagem));
+              close(conexao);
+              return NULL;
+            }
 
-                    //mensagem 3 - recebendo que arquivo OK do cliente
-                    read(conexao, resposta, MAX_MSG);
+            curl_global_init(CURL_GLOBAL_ALL);
 
+            /* init the curl session */
+            curl_handle = curl_easy_init();
 
-                    //**************************************//
-                    //      FIM DO PROTOCOLO               //
-                    //*************************************//
+            if(curl_handle) {
+                /* specify URL to get */
+                curl_easy_setopt(curl_handle, CURLOPT_URL, "http://tinywebdb.appinventor.mit.edu/getvalue");
 
-                    //abrindo o arquivo e retirando o tamanho//
-                    //fazendo copia do nome do arquivo para variavel auxiliar. tal variavel é utilizada para localizar
-                    // o arquivo no diretorio.
+                /* send all data to this function  */
+                curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
 
+                /* we pass our 'chunk' struct to the callback function */
+                curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
 
-                    char localArquivo[1024]; 
-                    strncpy(localArquivo, argv[2], 1024);
-                    strcat(localArquivo,aux_nomeArquivo);
+                /* some servers do not like requests that are made without a user-agent
+                 field, so we provide one */
+                curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "libcurl-agent/1.0");
 
-                    FILE * f = fopen(localArquivo, "rb");
-                    if((fseek(f, 0, SEEK_END))<0){printf("ERRO DURANTE fseek");}
-                    int len = (int) ftell(f);                   
-                    mensagem = (char*) len;
-                    printf("Tamanho do arquivo: %d\n", len);
-                    //convertendo o valor do tamanho do arquivo (int) para ser enviado em uma mensagem no scoket(char)
-                    char *p, text[32];
-                    int a = len;
-                    sprintf(text, "%d", len);
-                    mensagem = text;
+                /* Now specify the POST data */
+                curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, "tag=qrcode_mp30_approved&fmt=html");
 
-                    //mensagem 4 - enviando o tamanho do arquivo
-                    send(conexao, mensagem, strlen(mensagem), 0);
+                for (; count < 30; count++)
+                {   
+                    free(chunk.memory);
+                    chunk.size = 0;
+                    /* get it! */
+                    res = curl_easy_perform(curl_handle);
 
-                    int fd = open(localArquivo, O_RDONLY);
-                    off_t offset = 0;
-                    int sent_bytes = 0;
-                    //localArquivo = NULL;
-                    if (fd == -1) {
-                        fprintf(stderr, "Error opening file --> %s", strerror(errno));
-
-                        exit(EXIT_FAILURE);
-                    }
-
-                    while (((sent_bytes = sendfile(conexao, fd, &offset, BUFSIZ)) > 0)&& (len > 0)) {
-
-                        fprintf(stdout, "1. Servidor enviou %d bytes do arquivo, offset Ã© agora : %d e os dados restantes = %d\n", sent_bytes, (int)offset, len);
-                        len -= sent_bytes;
-                        fprintf(stdout, "2.Servidor enviou %d bytes do arquivo, offset Ã© agora : %d e os dados restantes = %d\n", sent_bytes, (int)offset, len);
-                        if (len <= 0) {
+                    /* check for errors */
+                    if(res != CURLE_OK) {
+                        fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+                    }else {
+                        printf("%lu bytes retrieved\n", (unsigned long)chunk.size);
+                        printf("%s\n", chunk.memory);
+                        if (strncmp(chunk.memory, "TRUE", 4) == 0){
                             break;
                         }
                     }
-                    //closedir(mydir);
-                    while (1) {
-                    }
-
+                    sleep(1000);
                 }
-            }if(myfile==NULL) {
-                    //enviando mensagem para o cliente de arquivo nao encontrado.
-                    mensagem = "404";//file not found
-                    printf("\n//*********************************//\n");
-                    printf("Arquivo \"%s\" NÃ£o Existe no diretório: \"%s\"\n",aux_nomeArquivo, argv[2]);
-                    //mensagem 2 - enviando confirmação q arquivo existe
-                    write(conexao, mensagem, strlen(mensagem));
-                    //sempre que termina de pesquisar o diretorio de arquivos a variavel myfile vai para null
-                    // entao eh necessario preencher mydir novamente com o argv[2] com o diretorio de pesquisa. 
-                    //caso contrario novas thread nao acessaram o diretorio passado em argv[2]]
-                    mydir = opendir(argv[2]);
-                    //
-                    while (1) {
-                    }
-                    close(conexao);
-                    //closedir(mydir);
 
+
+                /* cleanup curl stuff */
+                curl_easy_cleanup(curl_handle);
             }
-            if (mydir != NULL) {
-                closedir(mydir);
-                mydir = NULL;
-            }
+
+            /* we are done with libcurl, so clean it up */
+            curl_global_cleanup();
+
         }
 
-        if (strcmp(resposta, "bye\n") == 0) {
-            close(conexao);
-            printf("Servidor finalizado...\n");
-            return NULL;
+        if (count == 30){
+          mensagem = "400";
+          write(conexao, mensagem, strlen(mensagem));
+        }else{
+          mensagem = "200";
+          write(conexao, mensagem, strlen(mensagem));
         }
 
+        close(conexao);
+        printf("Servidor finalizado...\n");
+        return NULL;
 
     }
 
@@ -207,7 +234,6 @@ int main(int argc, char* argv[]) {
     //      FIM DO TRATAMENTO DA THREAD, localização e transferencia    // 
     //      do arquivo.                                                    // 
     //*********************************************************************//
-
 
 
     //************************************************************
